@@ -1,0 +1,175 @@
+# VALIDATION CANDIDATE: independent review required before publication.
+# Runs only on first creation of this exact dedicated fork branch.
+name: Uproot 1836 isolated validation
+on:
+  push:
+    branches:
+      - validation/uproot1836-20261112b
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: >-
+      github.repository == 'dhairyajangir/uproot5' &&
+      github.ref == 'refs/heads/validation/uproot1836-20261112b' &&
+      github.event.created == true &&
+      github.event.after == github.sha
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [cpu, hooks]
+    defaults:
+      run:
+        shell: bash -el {0}
+    env:
+      EXPECTED_HEAD: 0fc273864e36eed1154fd47a7a974e1511147da9
+      EXPECTED_CANDIDATE_TREE: 71712d782b84807a1a8b21b73589216842737113
+      EXPECTED_PATCH_SHA256: 00ee0b94d4f5547d728dba542ea03a5dee95488ba834ad96cb50a3359a9ae8d7
+      EXPECTED_BASE: 8503a78187b11564abbf517628be5558fba274af
+      EXPECTED_INTEGRATION_TREE: ac6c92f8e4738ed6aa5fc5d52166c94ae80a6145
+      EXPECTED_PR_HEAD_REF: fix/rntuple-schema-preserve-rows
+      CARRIER_PATH: .github/workflows/uproot-1836-validation.yml
+      PRE_COMMIT_VERSION: 4.7.0
+    steps:
+      - name: Checkout carrier without persistent credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify candidate and integrated tree
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_INTEGRATION_TREE" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PRE_COMMIT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$EVENT_SHA"
+          test "$(git show -s --format=%P HEAD | wc -w)" -eq 1
+          candidate=$(git rev-parse 'HEAD^')
+          test "$(git show -s --format=%P "$candidate" | wc -w)" -eq 1
+          test "$(git rev-parse "$candidate^" )" = "$EXPECTED_HEAD"
+          test "$(git rev-parse "$candidate^{tree}")" = "$EXPECTED_CANDIDATE_TREE"
+          mapfile -d '' -t carrier_paths < <(git diff --name-only -z "$candidate" HEAD)
+          test "${#carrier_paths[@]}" -eq 1
+          test "${carrier_paths[0]}" = "$CARRIER_PATH"
+          git ls-tree --name-only HEAD -- "$CARRIER_PATH" | grep -Fx "$CARRIER_PATH"
+          sha256sum "$CARRIER_PATH"  # compare independently to reviewed digest after push
+          mapfile -d '' -t changed < <(git diff --name-only -z "$EXPECTED_HEAD" "$candidate")
+          test "${#changed[@]}" -eq 3
+          test "${changed[0]}" = src/uproot/writing/_cascadentuple.py
+          test "${changed[1]}" = src/uproot/writing/writable.py
+          test "${changed[2]}" = tests/test_1808_rntuple_schema_evolution.py
+          actual_patch=$(git -c core.abbrev=7 -c diff.mnemonicPrefix=false -c diff.noprefix=false \
+            diff --no-ext-diff --no-color --no-renames --binary "$EXPECTED_HEAD" "$candidate" | sha256sum)
+          test "${actual_patch%% *}" = "$EXPECTED_PATCH_SHA256"
+          gh api repos/scikit-hep/uproot5/pulls/1836 | jq -e \
+            --arg head "$EXPECTED_HEAD" --arg ref "$EXPECTED_PR_HEAD_REF" \
+            '.state == "open" and .head.sha == $head and .head.ref == $ref and
+             .head.repo.full_name == "dhairyajangir/uproot5" and .base.repo.full_name == "scikit-hep/uproot5" and .base.ref == "main"' >/dev/null
+          git fetch --no-tags https://github.com/scikit-hep/uproot5.git refs/heads/main
+          test "$(git rev-parse FETCH_HEAD)" = "$EXPECTED_BASE"
+          integrated=$(git merge-tree --write-tree "$EXPECTED_BASE" "$candidate")
+          test "$integrated" = "$EXPECTED_INTEGRATION_TREE"
+          export GIT_AUTHOR_NAME='Validation runner' GIT_AUTHOR_EMAIL='validation@example.invalid'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          export GIT_AUTHOR_DATE='2000-01-01T00:00:00Z'
+          export GIT_COMMITTER_DATE="$GIT_AUTHOR_DATE"
+          synthetic=$(printf '%s\n' 'Ephemeral validation integration' | git commit-tree "$integrated" -p "$EXPECTED_BASE" -p "$candidate")
+          git checkout --detach "$synthetic"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_INTEGRATION_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          printf 'event=%s\ncandidate=%s\nbase=%s\nintegration_commit=%s\nintegration_tree=%s\n' \
+            "$EVENT_SHA" "$candidate" "$EXPECTED_BASE" "$synthetic" "$integrated"
+      - name: Configure Python, ROOT and XRootD
+        if: matrix.scope == 'cpu'
+        uses: mamba-org/setup-micromamba@f457c30a868e4760d3a6fcea5f25dc655b8edf39
+        with:
+          environment-name: test-env
+          init-shell: bash
+          micromamba-version: 2.6.0-0
+          create-args: >-
+            --strict-channel-priority
+            conda-forge/label/python_rc::_python_rc
+            python=3.14
+            root
+            xrootd
+      - name: Set up Python for hook runner
+        if: matrix.scope == 'hooks'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.14'
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: "0.13.7"
+      - name: Install project test dependencies and loopback SSH
+        if: matrix.scope == 'cpu'
+        run: |
+          set -euo pipefail
+          python -c 'import sys; assert sys.version_info[:2] == (3, 14), sys.version'
+          sudo apt-get update
+          # Ephemeral hosted runner: prevent the package from starting a public listener.
+          test ! -e /usr/sbin/policy-rc.d
+          printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod 755 /usr/sbin/policy-rc.d
+          trap 'sudo rm -f /usr/sbin/policy-rc.d' EXIT
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server
+          sudo rm -f /usr/sbin/policy-rc.d
+          trap - EXIT
+          test -z "$(ss -ltnH '( sport = :22 )')"
+          sudo install -d -m 0755 /run/sshd
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          ssh-keygen -q -t rsa -N '' -f "$HOME/.ssh/id_rsa"
+          cat "$HOME/.ssh/id_rsa.pub" >> "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+          sshd_config="$RUNNER_TEMP/uproot-sshd-config"
+          cat > "$sshd_config" <<'CONFIG'
+          Port 22
+          ListenAddress 127.0.0.1
+          HostKey /etc/ssh/ssh_host_ed25519_key
+          AuthorizedKeysFile .ssh/authorized_keys
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          PermitRootLogin no
+          UsePAM yes
+          PidFile /run/sshd-uproot-validation.pid
+          Subsystem sftp internal-sftp
+          CONFIG
+          sudo /usr/sbin/sshd -t -f "$sshd_config"
+          test "$(sudo /usr/sbin/sshd -T -f "$sshd_config" | awk '$1 == "listenaddress" {print $2}')" = '127.0.0.1:22'
+          sudo /usr/sbin/sshd -f "$sshd_config"
+          test "$(ss -ltnH '( sport = :22 )' | awk '{print $4}')" = '127.0.0.1:22'
+          ssh-keyscan -H localhost >> "$HOME/.ssh/known_hosts"
+          ssh localhost echo 'loopback SSH connection successful'
+          uv pip install --group=test-xrootd
+          uv pip install --system -e. --group=dev
+          python --version
+          uv --version
+          python -c 'import sys, ROOT, XRootD, uproot; print("Interpreter:", sys.executable); print("ROOT:", ROOT.__file__); print("XRootD:", XRootD.__file__); print("Uproot:", uproot.__file__)'
+          uv pip list --system
+      - name: Run complete CPU test collection
+        if: matrix.scope == 'cpu'
+        run: |
+          set -euo pipefail
+          python -m pytest -vv -n auto tests
+      - name: Run all pre-commit hooks
+        if: matrix.scope == 'hooks'
+        run: |
+          set -euo pipefail
+          uvx --from "pre-commit==$PRE_COMMIT_VERSION" pre-commit --version
+          uvx --from "pre-commit==$PRE_COMMIT_VERSION" pre-commit run --all
+      - name: Verify tested source tree was not modified
+        if: always() && steps.prepare.outcome == 'success'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_INTEGRATION_TREE"
+          git diff --exit-code
+          git diff --cached --exit-code
+          git status --short --untracked-files=all
+          test -z "$(git status --porcelain --untracked-files=all)"
